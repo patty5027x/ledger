@@ -124,6 +124,7 @@ label.f textarea{height:80px;padding:10px 14px}
 .wave i{width:3px;background:var(--ink);border-radius:2px;animation:wv 1s ease-in-out infinite}
 .wave i:nth-child(2){animation-delay:.1s}.wave i:nth-child(3){animation-delay:.2s}.wave i:nth-child(4){animation-delay:.3s}.wave i:nth-child(5){animation-delay:.4s}
 @keyframes wv{0%,100%{height:6px}50%{height:22px}}
+.wave.lv i{animation:none;height:4px;transition:height .08s linear}
 .parsed{background:var(--soft);border-radius:20px;padding:14px}
 .parsed .bigamt{font-family:var(--serif);font-size:34px;font-weight:600;text-align:center}
 .mini{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:10px}
@@ -543,6 +544,20 @@ async function aiParse(text) {
     '規則：type 是 expense（花錢）、income（收入，例如薪水、入帳）或 saving（存錢、買股票）。amount 是正數台幣。name 是簡短的店名或品項（2~8 字）。date 用 YYYY-MM-DD，「昨天」「前天」要換算，沒說就是今天。\n' +
     '使用者說：「' + text + '」';
   return gemini([{ text: prompt }], ENTRY_SCHEMA);
+}
+async function aiParseAudio(b64) {
+  const st = S.settings;
+  const prompt = '你是記帳助理。附檔是使用者用台灣國語（可能夾雜台語、英文店名）說的一句記帳語音。\n' +
+    '1. 先把語音逐字聽寫成繁體中文放在 transcript（數字用阿拉伯數字，例如「兩百六」寫成 260、「一千二」寫成 1200、「兩萬五千五百七十八」寫成 25578）。\n' +
+    '2. 再把它轉成一筆記帳資料。今天是 ' + todayISO() + '。\n' +
+    '支出分類只能從這些選：' + st.categories.map(c => c.name).join('、') + '。\n' +
+    '信用卡（沒提到就空字串）：' + (st.cards.map(c => c.name).join('、') || '無') + '。\n' +
+    '儲蓄分類：' + st.savingsCats.map(c => c.name).join('、') + '。收入來源：' + st.incomeSources.join('、') + '、其他。\n' +
+    '規則：type 是 expense（花錢）、income（收入，例如薪水、入帳）或 saving（存錢、買股票）。amount 是正數台幣。name 是簡短的店名或品項（2~8 字）。date 用 YYYY-MM-DD，「昨天」「前天」要換算，沒說就是今天。\n' +
+    '如果聽不到任何話，transcript 給空字串、amount 給 0。';
+  const schema = JSON.parse(JSON.stringify(ENTRY_SCHEMA));
+  schema.properties.transcript = { type: 'STRING' }; schema.required = ['transcript', 'type', 'amount', 'name'];
+  return gemini([{ text: prompt }, { inline_data: { mime_type: 'audio/wav', data: b64 } }], schema);
 }
 async function aiCoach(entry, ym) {
   const b = budgetOf(ym), sp = expenseOf(ym), left = b - sp;
@@ -1080,6 +1095,7 @@ document.addEventListener('click', async ev => {
     // 氣球裡的動作
     case 'bKeyboard': balloonText(); break;
     case 'bVoice': startVoice(); break;
+    case 'bStop': BAL && BAL.stop && BAL.stop(); break;
     case 'bPhoto': billPhotoFlow(); break;
     case 'bClose': closeBalloon(); break;
     case 'bConfirm': confirmParsed(); break;
@@ -1111,16 +1127,99 @@ const bSet = html => { $('#bIn').innerHTML = html; };
 const bTop = (status, live) => '<div style="display:flex;align-items:center;gap:10px"><span style="width:44px;height:44px;border-radius:22px;background:var(--ink);color:#FFF;display:flex;align-items:center;justify-content:center">' + ICON.mic + '</span>' +
   (live ? '<span class="wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>' : '') + '<span style="flex:1;font-size:13px;color:var(--muted)">' + status + '</span>' +
   '<button class="circle sm" data-act="bKeyboard" aria-label="改用打字">' + ICON.kb + '</button><button class="circle sm" data-act="bPhoto" aria-label="拍帳單">' + ICON.cam + '</button></div>';
+const VOICE_HINT = '例：「晚餐拉麵 260」「費瑪薪水 25578」「存股票 5000」';
 function startVoice() {
+  const hasKey = !!geminiKey();
+  const canRec = navigator.mediaDevices && navigator.mediaDevices.getUserMedia && (window.AudioContext || window.webkitAudioContext);
+  if (hasKey && canRec) return startGeminiVoice();
+  return startWebSpeech();
+}
+// 錄音 → 交給 Gemini 聽寫＋整理（比瀏覽器內建辨識準，數字、店名都比較穩）
+async function startGeminiVoice() {
+  if (!BAL) return; const myBal = BAL;
+  bSet(bTop('開麥克風中…') + '<div class="parsed" style="text-align:center;min-height:54px"><span class="muted" style="font-size:15px">' + VOICE_HINT + '</span></div>');
+  let stream;
+  try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } }); }
+  catch (e) { if (BAL === myBal) balloonText('拿不到麥克風權限，可以改用打字'); return; }
+  if (BAL !== myBal) { stream.getTracks().forEach(t => t.stop()); return; }
+  const AC = window.AudioContext || window.webkitAudioContext; const ctx = new AC();
+  try { await ctx.resume(); } catch (e) {}
+  const src = ctx.createMediaStreamSource(stream); const proc = ctx.createScriptProcessor(4096, 1, 1);
+  const chunks = []; let heard = false, lastLoud = 0, done = false, noise = 0.004, frames = 0;
+  const t0 = performance.now();
+  const cleanup = () => { try { proc.disconnect(); src.disconnect(); } catch (e) {} stream.getTracks().forEach(t => t.stop()); try { ctx.close(); } catch (e) {} clearInterval(timer); $('#mic').classList.remove('live'); };
+  const cancel = () => { if (done) return; done = true; cleanup(); };
+  const finish = async () => {
+    if (done) return; done = true; cleanup();
+    if (BAL !== myBal) return;
+    if (!heard) { bSet(bTop('沒聽到聲音，靠近一點再說一次') + '<button class="blackbtn" data-act="bVoice">再說一次</button>'); return; }
+    bSet(bTop('AI 聽寫中…') + '<div class="parsed" style="text-align:center"><div class="muted" style="font-size:13px">正在辨識你剛剛說的話</div></div>');
+    let p;
+    try { p = await aiParseAudio(wavBase64(chunks, ctx.sampleRate)); }
+    catch (e) { if (BAL !== myBal) return; toast('AI 聽寫失敗，改用瀏覽器辨識'); return startWebSpeech(); }
+    if (BAL !== myBal) return;
+    const tr = (p.transcript || '').trim();
+    if (!tr || !(+p.amount > 0)) { bSet(bTop(tr ? '聽到了，但沒抓到金額' : '沒聽清楚，再說一次') + (tr ? '<div class="parsed" style="text-align:center"><div class="muted" style="font-size:13px">「' + esc(tr) + '」</div></div>' : '') + '<button class="blackbtn" data-act="bVoice">再說一次</button>'); return; }
+    BAL.transcript = tr; BAL.parsed = normalizeParsed(p); BAL.ai = true; showParsed();
+  };
+  myBal.rec = { abort: cancel }; myBal.stop = finish; myBal.transcript = '';
+  bSet(bTop('正在聽…說完會自動停', true) + '<div class="parsed" style="text-align:center;min-height:54px"><span class="muted" style="font-size:15px">' + VOICE_HINT + '</span></div>' +
+    '<button class="blackbtn" data-act="bStop">說完了</button>');
+  const wave = $('#bIn .wave'); if (wave) wave.classList.add('lv');
+  const bars = wave ? [...wave.querySelectorAll('i')] : [];
+  $('#mic').classList.add('live');
+  proc.onaudioprocess = ev => {
+    if (done) return;
+    const d = ev.inputBuffer.getChannelData(0); chunks.push(new Float32Array(d));
+    let sum = 0; for (let i = 0; i < d.length; i++) sum += d[i] * d[i];
+    const rms = Math.sqrt(sum / d.length); frames++;
+    if (frames <= 4) noise = Math.max(noise, rms * 1.5); // 前 0.3 秒當環境音
+    const now = performance.now();
+    if (rms > Math.max(0.012, noise * 2.2)) { heard = true; lastLoud = now; }
+    const lv = Math.min(1, rms / 0.12);
+    bars.forEach((b, i) => { b.style.height = (4 + lv * 20 * (0.55 + 0.45 * Math.abs(Math.sin(now / 90 + i)))) + 'px'; });
+  };
+  src.connect(proc); proc.connect(ctx.destination);
+  const timer = setInterval(() => {
+    const now = performance.now(), el = now - t0;
+    if (el > 15000) return finish();                                   // 最長 15 秒
+    if (heard && el > 1200 && now - lastLoud > 1500) return finish();  // 講完停 1.5 秒自動送出
+    if (!heard && el > 7000) return finish();                          // 7 秒都沒聲音
+  }, 150);
+}
+// 把錄音轉成 16kHz 單聲道 WAV（base64），檔案小、上傳快
+function wavBase64(chunks, rate) {
+  let len = 0; chunks.forEach(c => len += c.length);
+  const all = new Float32Array(len); let o = 0; chunks.forEach(c => { all.set(c, o); o += c.length; });
+  const target = 16000, ratio = rate / target, n = Math.floor(len / ratio);
+  const pcm = new Int16Array(n);
+  for (let i = 0; i < n; i++) {
+    const s0 = Math.floor(i * ratio), s1 = Math.min(len, Math.floor((i + 1) * ratio)); let acc = 0, k = 0;
+    for (let j = s0; j < s1; j++) { acc += all[j]; k++; }
+    const v = Math.max(-1, Math.min(1, k ? acc / k : 0)); pcm[i] = v < 0 ? v * 0x8000 : v * 0x7FFF;
+  }
+  const buf = new ArrayBuffer(44 + pcm.length * 2), dv = new DataView(buf);
+  const w = (p, str) => { for (let i = 0; i < str.length; i++) dv.setUint8(p + i, str.charCodeAt(i)); };
+  w(0, 'RIFF'); dv.setUint32(4, 36 + pcm.length * 2, true); w(8, 'WAVE'); w(12, 'fmt ');
+  dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true); dv.setUint32(24, target, true);
+  dv.setUint32(28, target * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true); w(36, 'data'); dv.setUint32(40, pcm.length * 2, true);
+  new Int16Array(buf, 44).set(pcm);
+  const bytes = new Uint8Array(buf); let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+// 沒有 Gemini key 時：用瀏覽器內建辨識，但改成連續聽，說完按「說完了」
+function startWebSpeech() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) { balloonText('這個瀏覽器不支援語音，用打字或鍵盤上的麥克風輸入'); return; }
-  const rec = new SR(); rec.lang = 'zh-TW'; rec.interimResults = true; rec.continuous = false;
-  BAL.rec = rec; BAL.transcript = '';
-  bSet(bTop('正在聽…直接說就好', true) + '<div class="parsed" style="text-align:center;min-height:54px"><span id="liveTxt" class="muted" style="font-size:15px">例：「晚餐拉麵 260」「費瑪薪水 25578」「存股票 5000」</span></div>');
+  const rec = new SR(); rec.lang = 'zh-TW'; rec.interimResults = true; rec.continuous = true; rec.maxAlternatives = 1;
+  BAL.rec = rec; BAL.transcript = ''; BAL.stop = () => { try { rec.stop(); } catch (e) {} };
+  let quiet = null; const armQuiet = () => { clearTimeout(quiet); quiet = setTimeout(() => { try { rec.stop(); } catch (e) {} }, 1800); };
+  bSet(bTop('正在聽…直接說就好', true) + '<div class="parsed" style="text-align:center;min-height:54px"><span id="liveTxt" class="muted" style="font-size:15px">' + VOICE_HINT + '</span></div><button class="blackbtn" data-act="bStop">說完了</button>');
   $('#mic').classList.add('live');
-  rec.onresult = e => { let t = ''; for (let i = 0; i < e.results.length; i++) t += e.results[i][0].transcript; BAL && (BAL.transcript = t); const l = $('#liveTxt'); if (l) { l.textContent = '「' + t + '」'; l.classList.remove('muted'); } };
-  rec.onerror = e => { $('#mic').classList.remove('live'); if (!BAL) return; if (e.error === 'no-speech') bSet(bTop('沒聽到聲音，再按一次麥克風或改用打字') + '<button class="blackbtn" data-act="bVoice">再說一次</button>'); else if (e.error !== 'aborted') balloonText('語音辨識失敗（' + e.error + '），可以改用打字'); };
-  rec.onend = () => { $('#mic').classList.remove('live'); if (BAL && BAL.transcript) handleText(BAL.transcript); };
+  rec.onresult = e => { let t = ''; for (let i = 0; i < e.results.length; i++) t += e.results[i][0].transcript; BAL && (BAL.transcript = t); const l = $('#liveTxt'); if (l) { l.textContent = '「' + t + '」'; l.classList.remove('muted'); } armQuiet(); };
+  rec.onerror = e => { clearTimeout(quiet); $('#mic').classList.remove('live'); if (!BAL) return; if (e.error === 'no-speech') bSet(bTop('沒聽到聲音，再按一次麥克風或改用打字') + '<button class="blackbtn" data-act="bVoice">再說一次</button>'); else if (e.error !== 'aborted') balloonText('語音辨識失敗（' + e.error + '），可以改用打字'); };
+  rec.onend = () => { clearTimeout(quiet); $('#mic').classList.remove('live'); if (BAL && BAL.rec === rec && BAL.transcript) handleText(BAL.transcript); };
   try { rec.start(); } catch (e) { balloonText('無法開始錄音，可以改用打字'); }
 }
 function balloonText(note) {
