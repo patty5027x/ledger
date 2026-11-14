@@ -542,13 +542,14 @@ async function aiParse(text) {
     '信用卡（沒提到就空字串）：' + (st.cards.map(c => c.name).join('、') || '無') + '。\n' +
     '儲蓄分類：' + st.savingsCats.map(c => c.name).join('、') + '。收入來源：' + st.incomeSources.join('、') + '、其他。\n' +
     '規則：type 是 expense（花錢）、income（收入，例如薪水、入帳）或 saving（存錢、買股票）。amount 是正數台幣。name 是簡短的店名或品項（2~8 字）。date 用 YYYY-MM-DD，「昨天」「前天」要換算，沒說就是今天。\n' +
+    '口語數字：「兩百五」是 250、「一千二」是 1200、「三萬五」是 35000、「兩百二十五」是 225、「五十塊」是 50。\n' +
     '使用者說：「' + text + '」';
   return gemini([{ text: prompt }], ENTRY_SCHEMA);
 }
 async function aiParseAudio(b64) {
   const st = S.settings;
   const prompt = '你是記帳助理。附檔是使用者用台灣國語（可能夾雜台語、英文店名）說的一句記帳語音。\n' +
-    '1. 先把語音逐字聽寫成繁體中文放在 transcript（數字用阿拉伯數字，例如「兩百六」寫成 260、「一千二」寫成 1200、「兩萬五千五百七十八」寫成 25578）。\n' +
+    '1. 先把語音逐字聽寫成繁體中文放在 transcript（數字用阿拉伯數字，口語省略單位要補回：「兩百五」寫成 250、「兩百六」寫成 260、「一千二」寫成 1200、「三萬五」寫成 35000、「兩百二十五」寫成 225、「兩萬五千五百七十八」寫成 25578）。\n' +
     '2. 再把它轉成一筆記帳資料。今天是 ' + todayISO() + '。\n' +
     '支出分類只能從這些選：' + st.categories.map(c => c.name).join('、') + '。\n' +
     '信用卡（沒提到就空字串）：' + (st.cards.map(c => c.name).join('、') || '無') + '。\n' +
@@ -585,7 +586,29 @@ const KW = [
   ['訂閱', /netflix|spotify|訂閱|youtube|icloud|disney|chatgpt|apple/i],
   ['醫療', /看診|藥|醫院|診所|牙/i], ['學習', /書|課|教材|樂譜|譜/i]
 ];
+// 把口語中文數字轉成阿拉伯數字：兩百五→250、一千二→1200、三萬五→35000、兩百二十五→225
+function zhToDigits(text) {
+  const D = { 零: 0, 〇: 0, 一: 1, 壹: 1, 二: 2, 兩: 2, 两: 2, 貳: 2, 三: 3, 參: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+  const U = { 十: 10, 拾: 10, 百: 100, 佰: 100, 千: 1000, 仟: 1000 };
+  const conv = str => {
+    let total = 0, sec = 0, num = 0, lastUnit = 0, sawZero = false;
+    for (const ch of str) {
+      if (ch in D) { if (D[ch] === 0) sawZero = true; num = D[ch]; continue; }
+      if (ch === '萬' || ch === '万') { sec += num; total += (sec || 1) * 10000; sec = 0; num = 0; lastUnit = 10000; sawZero = false; continue; }
+      const u = U[ch]; if (u) { sec += (num || (u === 10 ? 1 : 0)) * u; num = 0; lastUnit = u; sawZero = false; }
+    }
+    // 口語省略尾巴的單位：兩百五 = 250、一千二 = 1200、三萬五 = 35000
+    if (num && lastUnit >= 100 && !sawZero) num *= lastUnit / 10;
+    return total + sec + num;
+  };
+  return text.replace(/[零〇一壹二兩两貳三參四五六七八九十拾百佰千仟萬万]+/g, m => {
+    if (!/[一壹二兩两貳三參四五六七八九十拾百佰千仟]/.test(m)) return m;
+    if (m.length === 1 && !/[十拾]/.test(m)) return m; // 單一個「一」「三」多半不是金額
+    const v = conv(m); return v ? String(v) : m;
+  });
+}
 function ruleParse(text) {
+  text = zhToDigits(text);
   const nums = (text.replace(/,/g, '').match(/\d+(\.\d+)?/g) || []).map(Number);
   let amount = nums.length ? nums[nums.length - 1] : 0;
   const wan = text.match(/(\d+(\.\d+)?)\s*萬/); if (wan) amount = +wan[1] * 10000;
@@ -1131,18 +1154,22 @@ const VOICE_HINT = '例：「晚餐拉麵 260」「費瑪薪水 25578」「存�
 function startVoice() {
   const hasKey = !!geminiKey();
   const canRec = navigator.mediaDevices && navigator.mediaDevices.getUserMedia && (window.AudioContext || window.webkitAudioContext);
-  if (hasKey && canRec) return startGeminiVoice();
+  if (hasKey && canRec) {
+    // iPhone 要在按下去的當下就開 AudioContext，不然會一直是靜音
+    let ctx = null; try { const AC = window.AudioContext || window.webkitAudioContext; ctx = new AC(); ctx.resume(); } catch (e) {}
+    return startGeminiVoice(ctx);
+  }
   return startWebSpeech();
 }
 // 錄音 → 交給 Gemini 聽寫＋整理（比瀏覽器內建辨識準，數字、店名都比較穩）
-async function startGeminiVoice() {
+async function startGeminiVoice(preCtx) {
   if (!BAL) return; const myBal = BAL;
   bSet(bTop('開麥克風中…') + '<div class="parsed" style="text-align:center;min-height:54px"><span class="muted" style="font-size:15px">' + VOICE_HINT + '</span></div>');
   let stream;
   try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } }); }
-  catch (e) { if (BAL === myBal) balloonText('拿不到麥克風權限，可以改用打字'); return; }
-  if (BAL !== myBal) { stream.getTracks().forEach(t => t.stop()); return; }
-  const AC = window.AudioContext || window.webkitAudioContext; const ctx = new AC();
+  catch (e) { try { preCtx && preCtx.close(); } catch (x) {} if (BAL === myBal) balloonText('拿不到麥克風權限，可以改用打字'); return; }
+  if (BAL !== myBal) { stream.getTracks().forEach(t => t.stop()); try { preCtx && preCtx.close(); } catch (e) {} return; }
+  const AC = window.AudioContext || window.webkitAudioContext; const ctx = preCtx || new AC();
   try { await ctx.resume(); } catch (e) {}
   const src = ctx.createMediaStreamSource(stream); const proc = ctx.createScriptProcessor(4096, 1, 1);
   const chunks = []; let heard = false, lastLoud = 0, done = false, noise = 0.004, frames = 0;
@@ -1163,7 +1190,7 @@ async function startGeminiVoice() {
     BAL.transcript = tr; BAL.parsed = normalizeParsed(p); BAL.ai = true; showParsed();
   };
   myBal.rec = { abort: cancel }; myBal.stop = finish; myBal.transcript = '';
-  bSet(bTop('正在聽…說完會自動停', true) + '<div class="parsed" style="text-align:center;min-height:54px"><span class="muted" style="font-size:15px">' + VOICE_HINT + '</span></div>' +
+  bSet(bTop('AI 聽寫・說完會自動停', true) + '<div class="parsed" style="text-align:center;min-height:54px"><span class="muted" style="font-size:15px">' + VOICE_HINT + '</span></div>' +
     '<button class="blackbtn" data-act="bStop">說完了</button>');
   const wave = $('#bIn .wave'); if (wave) wave.classList.add('lv');
   const bars = wave ? [...wave.querySelectorAll('i')] : [];
@@ -1215,7 +1242,7 @@ function startWebSpeech() {
   const rec = new SR(); rec.lang = 'zh-TW'; rec.interimResults = true; rec.continuous = true; rec.maxAlternatives = 1;
   BAL.rec = rec; BAL.transcript = ''; BAL.stop = () => { try { rec.stop(); } catch (e) {} };
   let quiet = null; const armQuiet = () => { clearTimeout(quiet); quiet = setTimeout(() => { try { rec.stop(); } catch (e) {} }, 1800); };
-  bSet(bTop('正在聽…直接說就好', true) + '<div class="parsed" style="text-align:center;min-height:54px"><span id="liveTxt" class="muted" style="font-size:15px">' + VOICE_HINT + '</span></div><button class="blackbtn" data-act="bStop">說完了</button>');
+  bSet(bTop('手機內建辨識・正在聽', true) + '<div class="parsed" style="text-align:center;min-height:54px"><span id="liveTxt" class="muted" style="font-size:15px">' + VOICE_HINT + '</span></div><button class="blackbtn" data-act="bStop">說完了</button>');
   $('#mic').classList.add('live');
   rec.onresult = e => { let t = ''; for (let i = 0; i < e.results.length; i++) t += e.results[i][0].transcript; BAL && (BAL.transcript = t); const l = $('#liveTxt'); if (l) { l.textContent = '「' + t + '」'; l.classList.remove('muted'); } armQuiet(); };
   rec.onerror = e => { clearTimeout(quiet); $('#mic').classList.remove('live'); if (!BAL) return; if (e.error === 'no-speech') bSet(bTop('沒聽到聲音，再按一次麥克風或改用打字') + '<button class="blackbtn" data-act="bVoice">再說一次</button>'); else if (e.error !== 'aborted') balloonText('語音辨識失敗（' + e.error + '），可以改用打字'); };
@@ -1247,7 +1274,7 @@ function normalizeParsed(p) {
 function showParsed() {
   const p = BAL.parsed, st = S.settings;
   const typeLab = { expense: '支出', income: '收入', saving: '儲蓄' };
-  bSet(bTop(BAL.ai ? 'AI 辨識好了，確認一下' : '確認一下') +
+  bSet(bTop(!(+p.amount > 0) ? '沒抓到金額，請在下面補上' : BAL.ai ? 'AI 辨識好了，確認一下' : '確認一下') +
     '<div class="parsed"><div class="muted" style="font-size:12px;text-align:center">「' + esc(BAL.transcript) + '」</div>' +
     '<div class="bigamt">' + (p.type === 'expense' ? '−' : '+') + fmt(p.amount) + '</div>' +
     '<div class="mini">' +
@@ -1260,6 +1287,7 @@ function showParsed() {
     '</div></div>' +
     '<div class="grid2"><button class="greybtn" data-act="bClose">取消</button><button class="blackbtn" data-act="bConfirm">確認記帳</button></div>');
   $('#pType').addEventListener('change', e => { readParsed(); BAL.parsed.type = e.target.value; showParsed(); });
+  if (!(+p.amount > 0)) { const a = $('#pAmt'); if (a) { a.value = ''; a.style.outline = '2px solid var(--ink)'; a.focus(); } }
 }
 function readParsed() {
   const p = BAL.parsed; const v = id => { const el = $('#' + id); return el ? el.value : undefined; };
